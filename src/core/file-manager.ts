@@ -93,7 +93,7 @@ export class FileManager {
     this.debounceTimers.set(filePath, timer);
   }
   
-  private async performSync(fileInfo: FileInfo, preferIncrementalSync: boolean = true): Promise<void> {
+  private async performSync(fileInfo: FileInfo, preferIncrementalSync: boolean = true): Promise<boolean> {
     try {
       const existing = this.syncedFiles.get(fileInfo.path);
       let success = false;
@@ -133,11 +133,12 @@ export class FileManager {
       }
       
       if (success) {
+        const nextModelVersion = (existing?.modelVersion ?? 0) + 1;
         this.syncedFiles.set(fileInfo.path, {
           ...fileInfo,
-          modelVersion: (fileInfo.modelVersion || 0) + 1
+          modelVersion: nextModelVersion
         });
-        this.logger.info(`✅ 文件同步成功: ${fileInfo.path} (将使用文件同步模式)`);
+        this.logger.info(`✅ 文件同步成功: ${fileInfo.path} (version=${nextModelVersion})`);
       } else {
         // 同步失败，记录本地状态但标记为纯内容模式
         this.syncedFiles.set(fileInfo.path, {
@@ -146,9 +147,46 @@ export class FileManager {
         });
         this.logger.info(`💾 文件缓存本地: ${fileInfo.path} (将使用纯内容模式)`);
       }
+
+      return success;
     } catch (error) {
       this.logger.error(`Failed to sync file: ${fileInfo.path}`, error as Error);
+      return false;
     }
+  }
+
+  async forceSyncDocument(
+    document: vscode.TextDocument,
+    preferIncrementalSync: boolean = true
+  ): Promise<boolean> {
+    if (document.uri.scheme !== 'file') {
+      return false;
+    }
+
+    const filePath = vscode.workspace.asRelativePath(document.uri);
+    const content = document.getText();
+    const sha256 = CryptoUtils.calculateSHA256(content);
+
+    const existingTimer = this.debounceTimers.get(filePath);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      this.debounceTimers.delete(filePath);
+    }
+
+    const cached = this.syncedFiles.get(filePath);
+
+    const fileInfo: FileInfo = {
+      path: filePath,
+      content,
+      sha256,
+      modelVersion: cached?.modelVersion
+    };
+
+    return this.performSync(fileInfo, preferIncrementalSync);
+  }
+
+  getSyncedFileInfo(filePath: string): FileInfo | undefined {
+    return this.syncedFiles.get(filePath);
   }
   
   getFileInfo(filePath: string): FileInfo | undefined {

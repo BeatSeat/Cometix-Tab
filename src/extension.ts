@@ -4,7 +4,6 @@ import { Logger } from './utils/logger';
 import { CryptoUtils } from './utils/crypto';
 import { CursorApiClient } from './core/api-client';
 import { ConnectRpcApiClient } from './core/connect-rpc-api-client';
-import { ConnectRpcAdapter } from './adapters/connect-rpc-adapter';
 import { FileManager } from './core/file-manager';
 import { CursorCompletionProvider } from './core/completion-provider';
 import { StatusBar } from './ui/status-bar';
@@ -21,16 +20,30 @@ import { createPerformanceMonitor, getPerformanceMonitor } from './utils/perform
 import { createBatchSyncManager, getBatchSyncManager } from './utils/batch-sync-manager';
 import { FileSyncStateManager } from './core/filesync-state-manager';
 import { promptAndPatchIfNeeded } from './utils/product-json-patcher';
+import { TabDebouncer } from './core/tab/debouncer';
+import { FilesyncCoordinator } from './core/tab/filesync-coordinator';
+import { RequestBuilder } from './core/tab/request-builder';
+import { StreamManager } from './core/tab/stream-manager';
+import { SuggestionStore } from './core/tab/suggestion-store';
+import { TabStateMachine } from './core/tab/state-machine';
+import { TriggerController } from './core/tab/trigger-controller';
+import type { CppConfigResponse } from './generated/cpp_pb';
 
 let logger: Logger;
 let apiClient: CursorApiClient;
 let connectRpcClient: ConnectRpcApiClient;
-let connectRpcAdapter: ConnectRpcAdapter;
 let fileManager: FileManager;
 let completionProvider: CursorCompletionProvider;
 let statusBar: StatusBar;
 let statusIntegration: StatusIntegration;
 let fileSyncStateManager: FileSyncStateManager;
+let suggestionStore: SuggestionStore;
+let debouncer: TabDebouncer;
+let filesyncCoordinator: FilesyncCoordinator;
+let requestBuilder: RequestBuilder;
+let streamManager: StreamManager;
+let stateMachine: TabStateMachine;
+let triggerController: TriggerController;
 
 export async function activate(context: vscode.ExtensionContext) {
 	logger = Logger.getInstance();
@@ -98,31 +111,59 @@ export async function activate(context: vscode.ExtensionContext) {
 		// 🔧 初始化CppConfig配置
 		await connectRpcClient.initializeCppConfig();
 		
-		// 创建适配器
-		connectRpcAdapter = new ConnectRpcAdapter(connectRpcClient);
-		
-		// 初始化文件同步状态管理器
-		fileSyncStateManager = new FileSyncStateManager();
-		
-		// 初始化性能监控器
-		const performanceMonitor = createPerformanceMonitor();
+                // 初始化文件同步状态管理器
+                fileSyncStateManager = new FileSyncStateManager();
+
+                // 初始化性能监控器
+                const performanceMonitor = createPerformanceMonitor();
 		
 		// 初始化批处理同步管理器
 		const batchSyncManager = createBatchSyncManager(apiClient, fileSyncStateManager);
 		
-		fileManager = new FileManager(apiClient, config.debounceMs);
-		
-		// 使用 Connect RPC 适配器
-		completionProvider = new CursorCompletionProvider(connectRpcAdapter as any, fileManager);
+                fileManager = new FileManager(apiClient, config.debounceMs);
+
+                suggestionStore = new SuggestionStore();
+                debouncer = new TabDebouncer();
+                filesyncCoordinator = new FilesyncCoordinator(fileManager);
+                requestBuilder = new RequestBuilder();
+                streamManager = new StreamManager(apiClient);
+                streamManager.setConcurrencyCap(6);
+                stateMachine = new TabStateMachine();
+                triggerController = new TriggerController(
+                        debouncer,
+                        filesyncCoordinator,
+                        requestBuilder,
+                        streamManager,
+                        suggestionStore,
+                        stateMachine
+                );
+
+                const applyCppRuntimeConfig = (cppConfig: CppConfigResponse | null) => {
+                        if (!cppConfig) {
+                                return;
+                        }
+                        debouncer.setDebouncingDurations({
+                                clientDebounceDuration: cppConfig.clientDebounceDurationMillis || 25,
+                                globalDebounceDuration: cppConfig.globalDebounceDurationMillis || 60
+                        });
+                        filesyncCoordinator.updateConfig({
+                                enableFilesyncDebounceSkipping: cppConfig.enableFilesyncDebounceSkipping ?? false
+                        });
+                };
+
+                applyCppRuntimeConfig(connectRpcClient.getCachedCppConfig());
+
+                completionProvider = new CursorCompletionProvider(triggerController);
 		
 		// 注册补全提供者
-		const completionProviderDisposable = vscode.languages.registerInlineCompletionItemProvider(
-			{ pattern: '**' },
-			completionProvider
-		);
-		
-		// 启动文件监听
-		const fileWatcherDisposables = fileManager.startWatching();
+                const completionProviderDisposable = vscode.languages.registerInlineCompletionItemProvider(
+                        { pattern: '**' },
+                        completionProvider
+                );
+
+                context.subscriptions.push(suggestionStore);
+                // 启动文件监听
+                const fileWatcherDisposables = fileManager.startWatching();
 		
 		// 创建状态集成系统
 		statusIntegration = StatusIntegration.getInstance(context);
@@ -299,15 +340,16 @@ export async function activate(context: vscode.ExtensionContext) {
 		const setLogLevelCommand_ = vscode.commands.registerCommand('cometix-tab.setLogLevel', setLogLevelCommand);
 
 		// 新增命令：刷新CppConfig配置
-		const refreshConfigCommand = vscode.commands.registerCommand('cometix-tab.refreshCppConfig', async () => {
-			try {
-				vscode.window.showInformationMessage('🔄 正在刷新服务器配置...');
-				await connectRpcClient.initializeCppConfig();
-				vscode.window.showInformationMessage('✅ 服务器配置刷新完成');
-			} catch (error) {
-				logger.error('❌ 刷新配置失败', error as Error);
-				vscode.window.showErrorMessage('❌ 配置刷新失败，请查看日志了解详情');
-			}
+                const refreshConfigCommand = vscode.commands.registerCommand('cometix-tab.refreshCppConfig', async () => {
+                        try {
+                                vscode.window.showInformationMessage('🔄 正在刷新服务器配置...');
+                                await connectRpcClient.initializeCppConfig();
+                                applyCppRuntimeConfig(connectRpcClient.getCachedCppConfig());
+                                vscode.window.showInformationMessage('✅ 服务器配置刷新完成');
+                        } catch (error) {
+                                logger.error('❌ 刷新配置失败', error as Error);
+                                vscode.window.showErrorMessage('❌ 配置刷新失败，请查看日志了解详情');
+                        }
 		});
 
 		// 新增命令：测试连接
